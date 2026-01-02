@@ -1,0 +1,124 @@
+{
+  "identity": {
+    "name": "ResumeAI - The Obsidian Architect",
+    "persona": "E1 - Anti-AI Designer",
+    "vibe": "Electric & Neon (Archetype 2) meets Swiss Precision",
+    "description": "A high-contrast, futuristic interface that treats the resume not as a document, but as a data artifact being refined. Deep blacks, glowing accents, and holographic surfaces."
+  },
+  "typography": {
+    "primary_font": "Space Grotesk",
+    "secondary_font": "Manrope",
+    "mono_font": "JetBrains Mono",
+    "weights": {
+      "light": 300,
+      "regular": 400,
+      "medium": 500,
+      "bold": 700,
+      "black": 900
+    },
+    "instructions": "Import fonts from Google Fonts. Use Space Grotesk for all Headings (h1-h4). Use Manrope for body text. Use JetBrains Mono for code snippets, ATS scores, and data metrics."
+  },
+  "colors": {
+    "palette": {
+      "background": "#030304",
+      "surface": "#0A0A0F",
+      "surface_highlight": "#13131F",
+      "primary": "#6366F1",
+      "primary_glow": "#818CF8",
+      "secondary": "#EC4899",
+      "accent": "#06B6D4",
+      "text_primary": "#FFFFFF",
+      "text_secondary": "#94A3B8",
+      "text_muted": "#475569",
+      "border": "#1E293B",
+      "border_glow": "rgba(99, 102, 241, 0.3)",
+      "success": "#10B981",
+      "error": "#F43F5E",
+      "warning": "#F59E0B"
+    },
+    "gradients": {
+      "hero": "linear-gradient(135deg, #6366F1 0%, #EC4899 100%)",
+      "glass": "linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%)",
+      "glow_border": "linear-gradient(90deg, transparent, #6366F1, transparent)"
+    }
+  },
+  "visual_enhancers": {
+    "glassmorphism": {
+      "backdrop_filter": "blur(16px)",
+      "background": "rgba(10, 10, 15, 0.6)",
+      "border": "1px solid rgba(255, 255, 255, 0.08)",
+      "shadow": "0 8px 32px 0 rgba(0, 0, 0, 0.36)"
+    },
+    "neon_glow": {
+      "box_shadow": "0 0 20px rgba(99, 102, 241, 0.4)"
+    },
+    "grid_overlay": {
+      "style": "background-image: radial-gradient(#1E293B 1px, transparent 1px); background-size: 32px 32px; opacity: 0.2;"
+    }
+  },
+  "layout_strategies": {
+    "landing_page": {
+      "grid_type": "Mode A: The Tetris Grid",
+      "gap": "gap-8 md:gap-12",
+      "padding": "p-6 md:p-12 lg:p-24",
+      "structure": "Asymmetrical bento grid. Hero section uses col-span-full. Feature cards mix 1x1, 2x1, and 2x2 spans."
+    },
+    "dashboard": {
+      "grid_type": "Mode B: The Control Room",
+      "gap": "gap-4",
+      "padding": "p-4",
+      "structure": "Split screen. Left: Resume Preview (Holographic Paper). Right: Analysis & Controls (Dark Glass Panels). Sticky header for actions."
+    }
+  },
+  "components": {
+    "buttons": {
+      "primary": "bg-primary text-white rounded-full px-8 py-3 font-medium hover:shadow-[0_0_20px_rgba(99,102,241,0.5)] transition-all duration-300 hover:scale-105",
+      "secondary": "bg-transparent border border-border text-white rounded-full px-8 py-3 hover:border-primary hover:text-primary transition-all duration-300",
+      "ghost": "text-text_secondary hover:text-white transition-colors"
+    },
+    "cards": {
+      "default": "bg-surface/50 backdrop-blur-md border border-white/5 rounded-2xl p-6 hover:border-primary/30 transition-colors",
+      "highlight": "bg-gradient-to-br from-surface_highlight to-surface border border-primary/20 rounded-2xl p-6 shadow-lg"
+    },
+    "inputs": {
+      "style": "bg-surface border border-border rounded-lg px-4 py-3 text-white focus:border-primary focus:ring-1 focus:ring-primary outline-none transition-all placeholder:text-text_muted"
+    },
+    "resume_preview": {
+      "style": "bg-white/90 text-black rounded-sm shadow-2xl min-h-[800px] p-8 transform scale-[0.95] origin-top hover:scale-100 transition-transform duration-500 ease-out"
+    }
+  },
+  "image_urls": {
+    "hero_background": "https://images.unsplash.com/photo-1750969185331-e03829f72c7d?crop=entropy&cs=srgb&fm=jpg&q=85",
+    "feature_ai": "https://images.unsplash.com/photo-1676911809746-85d90edbbe4a?crop=entropy&cs=srgb&fm=jpg&q=85",
+    "workspace_context": "https://images.pexels.com/photos/5827833/pexels-photo-5827833.jpeg",
+    "success_abstract": "https://images.unsplash.com/photo-1643834004015-243c2f98e490?crop=entropy&cs=srgb&fm=jpg&q=85"
+  },
+  "motion": {
+    "entrance": {
+      "initial": { "opacity": 0, "y": 20 },
+      "animate": { "opacity": 1, "y": 0 },
+      "transition": { "duration": 0.5, "ease": "easeOut" }
+    },
+    "hover_lift": {
+      "whileHover": { "y": -5 }
+    },
+    "stagger": 0.1
+  },
+  "instructions_to_main_agent": [
+    "1. SETUP: Install 'framer-motion', 'lucide-react', 'clsx', 'tailwind-merge' immediately.",
+    "2. FONTS: Add Space Grotesk and Manrope via Google Fonts in index.html or CSS import.",
+    "3. THEME: Force DARK MODE by default. Do not implement a light mode toggle unless absolutely necessary. The brand is 'Obsidian'.",
+    "4. LAYOUT: For the Resume Upload/Analysis page, use a Split View. Left 50% = Resume Preview (Scrollable). Right 50% = AI Chat/Suggestions (Scrollable).",
+    "5. ATS SCORE: Visualize the ATS score using a circular progress bar with a glowing path. <70 = Red, 70-85 = Yellow, >85 = Green/Cyan.",
+    "6. APPROVAL FLOW: When suggesting changes, show a 'Diff' view (Old vs New). Use Green highlight for additions, Red strikethrough for deletions.",
+    "7. PDF GENERATION: Use 'react-pdf' or 'jspdf' for generating the final resume. Ensure the output is clean and standard (white background, black text) even if the app is dark mode.",
+    "8. MICRO-INTERACTIONS: Add subtle hover glows to all interactive elements. Use 'sonner' for all toast notifications (e.g., 'Resume Uploaded', 'Changes Applied')."
+  ],
+  "universal_guidelines": [
+    "Do not use generic gradients. Use noise/grain overlays for texture.",
+    "Avoid 'Inter' for headings. Use Space Grotesk.",
+    "Ensure all text has sufficient contrast (APCA standards).",
+    "Use 'data-testid' on all interactive elements.",
+    "Never use transparent backgrounds for dropdowns/modals without a blur."
+  ]
+}
