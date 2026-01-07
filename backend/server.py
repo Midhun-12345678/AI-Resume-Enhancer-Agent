@@ -1,8 +1,7 @@
 from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import Response, FileResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
@@ -11,29 +10,17 @@ from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone
 import json
-import tempfile
-import aiofiles
+import base64
 from io import BytesIO
 
-# PDF/DOCX processing
-import pdfplumber
-from docx import Document
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+# PDF processing with PyMuPDF
+import fitz  # PyMuPDF
 
 # LLM Integration
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
-
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
 
 # LLM API Key
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY')
@@ -45,158 +32,304 @@ api_router = APIRouter(prefix="/api")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Directory for generated PDFs
-PDF_OUTPUT_DIR = ROOT_DIR / "generated_pdfs"
-PDF_OUTPUT_DIR.mkdir(exist_ok=True)
+# =============================================================================
+# IN-MEMORY SESSION STORAGE (No MongoDB)
+# =============================================================================
+sessions: Dict[str, Dict[str, Any]] = {}
 
 # =============================================================================
 # PYDANTIC MODELS
 # =============================================================================
 
-class ResumeSection(BaseModel):
-    name: str
-    content: str
-    bullets: List[str] = []
+class AnalyzeRequest(BaseModel):
+    job_description: str
 
-class ParsedResume(BaseModel):
-    full_text: str
-    sections: Dict[str, Any]
-    skills: List[str] = []
-    experience: List[Dict[str, Any]] = []
-    education: List[Dict[str, Any]] = []
-    summary: str = ""
+class ApplyRequest(BaseModel):
+    session_id: str
+    approved_ids: List[str]
 
-class JobDescription(BaseModel):
+class TextBlock(BaseModel):
+    id: str
     text: str
-    keywords: List[str] = []
-    required_skills: List[str] = []
-    role_level: str = ""
-    tools_technologies: List[str] = []
+    page: int
+    bbox: List[float]  # [x0, y0, x1, y1]
+    font_name: str
+    font_size: float
+    color: List[float]  # RGB
 
 class Suggestion(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: str
     section: str
     original_text: str
     suggested_text: str
     reason: str
-    keywords_added: List[str] = []
-    status: str = "pending"  # pending, approved, rejected
+    keywords_added: List[str]
+    impact: str  # "high", "medium", "low"
+    text_block_id: Optional[str] = None
 
-class ATSAnalysis(BaseModel):
-    score_before: int
-    score_after: Optional[int] = None
-    missing_keywords: List[str] = []
-    weak_bullets: List[str] = []
-    suggestions: List[Suggestion] = []
-
-class Session(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    resume_text: str = ""
-    resume_sections: Dict[str, Any] = {}
-    job_description: str = ""
-    jd_analysis: Dict[str, Any] = {}
-    ats_analysis: Optional[Dict[str, Any]] = None
-    suggestions: List[Dict[str, Any]] = []
-    approved_changes: List[str] = []
-    rejected_changes: List[str] = []
-    optimized_resume: str = ""
-    pdf_path: str = ""
-    status: str = "created"  # created, analyzed, approved, completed
-
-class UploadResponse(BaseModel):
+class AnalysisResponse(BaseModel):
     session_id: str
+    ats_score_before: int
+    ats_score_potential: int
+    issues: List[str]
+    suggestions: List[Dict[str, Any]]
+    jd_keywords: List[str]
+    missing_keywords: List[str]
     message: str
-    resume_preview: str
-    sections_found: List[str]
-
-class AnalyzeRequest(BaseModel):
-    session_id: str
-    job_description: str
-
-class ApproveRequest(BaseModel):
-    session_id: str
-    approved_ids: List[str]
-    rejected_ids: List[str]
 
 # =============================================================================
-# HELPER FUNCTIONS
+# PDF PROCESSING WITH PyMuPDF
 # =============================================================================
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract text from PDF using pdfplumber."""
+def extract_text_with_positions(pdf_bytes: bytes) -> Dict[str, Any]:
+    """Extract text from PDF with position, font, and style metadata."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    
+    text_blocks = []
+    full_text = ""
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        
+        # Get detailed text blocks with formatting
+        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        
+        for block in blocks.get("blocks", []):
+            if block.get("type") == 0:  # Text block
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span.get("text", "").strip()
+                        if text:
+                            text_block = {
+                                "id": str(uuid.uuid4()),
+                                "text": text,
+                                "page": page_num,
+                                "bbox": list(span.get("bbox", [0, 0, 0, 0])),
+                                "font_name": span.get("font", ""),
+                                "font_size": span.get("size", 12),
+                                "color": span.get("color", 0),
+                                "flags": span.get("flags", 0)
+                            }
+                            text_blocks.append(text_block)
+                            full_text += text + " "
+    
+    doc.close()
+    
+    return {
+        "text_blocks": text_blocks,
+        "full_text": full_text.strip(),
+        "page_count": len(doc)
+    }
+
+def extract_text_simple(pdf_bytes: bytes) -> str:
+    """Extract plain text from PDF."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     text = ""
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+    for page in doc:
+        text += page.get_text() + "\n"
+    doc.close()
     return text.strip()
 
-def extract_text_from_docx(file_bytes: bytes) -> str:
-    """Extract text from DOCX file."""
-    doc = Document(BytesIO(file_bytes))
-    text = []
-    for paragraph in doc.paragraphs:
-        text.append(paragraph.text)
-    return "\n".join(text).strip()
+def find_text_in_pdf(pdf_bytes: bytes, search_text: str) -> List[Dict]:
+    """Find all occurrences of text in PDF with their positions."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    results = []
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        # Search for the text
+        text_instances = page.search_for(search_text)
+        
+        for rect in text_instances:
+            results.append({
+                "page": page_num,
+                "bbox": [rect.x0, rect.y0, rect.x1, rect.y1]
+            })
+    
+    doc.close()
+    return results
 
-def parse_resume_sections(text: str) -> Dict[str, Any]:
-    """Parse resume text into sections."""
-    sections = {
-        "summary": "",
-        "skills": [],
-        "experience": [],
-        "education": [],
-        "projects": [],
-        "certifications": [],
-        "other": ""
-    }
+def modify_pdf_text(pdf_bytes: bytes, replacements: List[Dict]) -> bytes:
+    """
+    Modify PDF by replacing text in-place.
     
-    lines = text.split('\n')
-    current_section = "other"
-    current_content = []
+    replacements: [
+        {
+            "original_text": "old text",
+            "new_text": "new text",
+            "page": 0 (optional, searches all if not provided)
+        }
+    ]
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     
-    section_keywords = {
-        "summary": ["summary", "objective", "profile", "about"],
-        "skills": ["skills", "technical skills", "core competencies", "technologies"],
-        "experience": ["experience", "work history", "employment", "professional experience"],
-        "education": ["education", "academic", "qualifications"],
-        "projects": ["projects", "portfolio"],
-        "certifications": ["certifications", "certificates", "licenses"]
-    }
-    
-    for line in lines:
-        line_lower = line.lower().strip()
-        section_found = False
+    for replacement in replacements:
+        original = replacement.get("original_text", "")
+        new_text = replacement.get("new_text", "")
+        target_page = replacement.get("page", None)
         
-        for section, keywords in section_keywords.items():
-            if any(kw in line_lower for kw in keywords) and len(line.strip()) < 50:
-                if current_content:
-                    if current_section in ["skills"]:
-                        sections[current_section] = [item.strip() for item in " ".join(current_content).split(",") if item.strip()]
-                    elif current_section in ["experience", "education", "projects"]:
-                        sections[current_section].append("\n".join(current_content))
-                    else:
-                        sections[current_section] = "\n".join(current_content)
-                current_section = section
-                current_content = []
-                section_found = True
-                break
+        if not original or not new_text:
+            continue
         
-        if not section_found and line.strip():
-            current_content.append(line.strip())
+        pages_to_check = [target_page] if target_page is not None else range(len(doc))
+        
+        for page_num in pages_to_check:
+            if page_num >= len(doc):
+                continue
+                
+            page = doc[page_num]
+            
+            # Find all instances of the original text
+            text_instances = page.search_for(original)
+            
+            for rect in text_instances:
+                # Get the font info from this area
+                blocks = page.get_text("dict", clip=rect)
+                font_name = "helv"  # Default font
+                font_size = 11
+                text_color = (0, 0, 0)  # Black
+                
+                # Try to extract font info from the area
+                for block in blocks.get("blocks", []):
+                    if block.get("type") == 0:
+                        for line in block.get("lines", []):
+                            for span in line.get("spans", []):
+                                font_name = span.get("font", "helv")
+                                font_size = span.get("size", 11)
+                                color_int = span.get("color", 0)
+                                # Convert integer color to RGB
+                                if isinstance(color_int, int):
+                                    r = ((color_int >> 16) & 255) / 255
+                                    g = ((color_int >> 8) & 255) / 255
+                                    b = (color_int & 255) / 255
+                                    text_color = (r, g, b)
+                                break
+                
+                # Step 1: Redact (white out) the original text
+                # Add a small padding to ensure complete coverage
+                redact_rect = fitz.Rect(
+                    rect.x0 - 1,
+                    rect.y0 - 1,
+                    rect.x1 + 1,
+                    rect.y1 + 1
+                )
+                
+                # Create redaction annotation
+                annot = page.add_redact_annot(redact_rect, fill=(1, 1, 1))  # White fill
+                
+                # Apply the redaction
+                page.apply_redactions()
+                
+                # Step 2: Insert new text at the same position
+                # Calculate text insertion point (bottom-left of bbox for baseline)
+                insert_point = fitz.Point(rect.x0, rect.y1 - 2)
+                
+                # Map common fonts to available ones
+                font_map = {
+                    "helv": "helv",
+                    "Helvetica": "helv",
+                    "Arial": "helv",
+                    "Times": "times-roman",
+                    "TimesNewRoman": "times-roman",
+                    "Courier": "courier",
+                }
+                
+                # Try to use a similar font
+                base_font = font_name.split("-")[0].split(",")[0]
+                mapped_font = font_map.get(base_font, "helv")
+                
+                # Adjust font size if new text is longer
+                adjusted_size = font_size
+                if len(new_text) > len(original) * 1.2:
+                    # Shrink font slightly if text is much longer
+                    ratio = len(original) / len(new_text)
+                    adjusted_size = max(font_size * ratio, font_size * 0.8)
+                
+                # Insert the new text
+                page.insert_text(
+                    insert_point,
+                    new_text,
+                    fontname=mapped_font,
+                    fontsize=adjusted_size,
+                    color=text_color
+                )
     
-    # Don't forget the last section
-    if current_content:
-        if current_section in ["skills"]:
-            sections[current_section] = [item.strip() for item in " ".join(current_content).split(",") if item.strip()]
-        elif current_section in ["experience", "education", "projects"]:
-            sections[current_section].append("\n".join(current_content))
+    # Save to bytes
+    output = BytesIO()
+    doc.save(output, garbage=4, deflate=True)
+    doc.close()
+    
+    return output.getvalue()
+
+# =============================================================================
+# ATS SCORE CALCULATION
+# =============================================================================
+
+def calculate_ats_score(resume_text: str, jd_keywords: List[str], required_skills: List[str]) -> Dict[str, Any]:
+    """Calculate ATS score based on keyword matching."""
+    resume_lower = resume_text.lower()
+    
+    # Count matched keywords
+    matched_keywords = []
+    missing_keywords = []
+    
+    all_keywords = list(set(jd_keywords + required_skills))
+    
+    for kw in all_keywords:
+        if kw.lower() in resume_lower:
+            matched_keywords.append(kw)
         else:
-            sections[current_section] = "\n".join(current_content)
+            missing_keywords.append(kw)
     
-    return sections
+    # Base score from keyword matching
+    if len(all_keywords) > 0:
+        keyword_score = (len(matched_keywords) / len(all_keywords)) * 70  # 70% weight to keywords
+    else:
+        keyword_score = 35
+    
+    # Bonus points
+    bonus = 0
+    
+    # Action verbs check
+    action_verbs = ['achieved', 'improved', 'developed', 'led', 'managed', 'created', 
+                   'implemented', 'designed', 'built', 'delivered', 'increased', 
+                   'reduced', 'optimized', 'launched', 'established']
+    action_verb_count = sum(1 for verb in action_verbs if verb in resume_lower)
+    if action_verb_count >= 5:
+        bonus += 10
+    elif action_verb_count >= 3:
+        bonus += 5
+    
+    # Metrics/numbers check
+    import re
+    numbers = re.findall(r'\d+%|\d+\+|\$\d+|\d+ years', resume_text)
+    if len(numbers) >= 5:
+        bonus += 10
+    elif len(numbers) >= 2:
+        bonus += 5
+    
+    # Structure check (has sections)
+    section_keywords = ['experience', 'education', 'skills', 'projects', 'summary']
+    sections_found = sum(1 for s in section_keywords if s in resume_lower)
+    if sections_found >= 4:
+        bonus += 10
+    elif sections_found >= 2:
+        bonus += 5
+    
+    total_score = min(100, int(keyword_score + bonus))
+    
+    return {
+        "score": total_score,
+        "matched_keywords": matched_keywords,
+        "missing_keywords": missing_keywords,
+        "action_verb_count": action_verb_count,
+        "metrics_count": len(numbers),
+        "sections_found": sections_found
+    }
+
+# =============================================================================
+# LLM ANALYSIS
+# =============================================================================
 
 async def analyze_with_llm(prompt: str, session_id: str) -> str:
     """Use LLM to analyze and generate suggestions."""
@@ -204,7 +337,11 @@ async def analyze_with_llm(prompt: str, session_id: str) -> str:
         chat = LlmChat(
             api_key=EMERGENT_LLM_KEY,
             session_id=f"resume-{session_id}",
-            system_message="You are an expert ATS (Applicant Tracking System) optimization specialist. You help optimize resumes for better ATS compatibility while maintaining truthfulness and professional tone. Always respond in valid JSON format."
+            system_message="""You are an expert ATS (Applicant Tracking System) optimization specialist. 
+You help optimize resumes for better ATS compatibility while maintaining truthfulness.
+You NEVER fabricate experience, metrics, or skills.
+You suggest improvements that are realistic and professional.
+Always respond in valid JSON format."""
         ).with_model("openai", "gpt-5.2")
         
         user_message = UserMessage(text=prompt)
@@ -212,137 +349,103 @@ async def analyze_with_llm(prompt: str, session_id: str) -> str:
         return response
     except Exception as e:
         logger.error(f"LLM Error: {e}")
-        raise HTTPException(status_code=500, detail=f"LLM analysis failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI analysis failed: {str(e)}")
 
-def calculate_ats_score(resume_text: str, jd_keywords: List[str], required_skills: List[str]) -> int:
-    """Calculate ATS compatibility score."""
-    resume_lower = resume_text.lower()
-    total_keywords = len(jd_keywords) + len(required_skills)
-    if total_keywords == 0:
-        return 50
-    
-    found_keywords = sum(1 for kw in jd_keywords if kw.lower() in resume_lower)
-    found_skills = sum(1 for skill in required_skills if skill.lower() in resume_lower)
-    
-    keyword_score = (found_keywords + found_skills) / total_keywords * 100
-    
-    # Additional scoring factors
-    has_action_verbs = any(verb in resume_lower for verb in ['achieved', 'improved', 'developed', 'led', 'managed', 'created', 'implemented'])
-    has_metrics = any(char.isdigit() for char in resume_text)
-    
-    bonus = 0
-    if has_action_verbs:
-        bonus += 5
-    if has_metrics:
-        bonus += 5
-    
-    return min(100, int(keyword_score + bonus))
+async def extract_jd_keywords(job_description: str, session_id: str) -> Dict[str, Any]:
+    """Extract keywords and requirements from job description."""
+    prompt = f"""Analyze this job description and extract key information.
 
-def generate_pdf(resume_data: Dict[str, Any], output_path: str) -> str:
-    """Generate a professional PDF from resume data."""
-    doc = SimpleDocTemplate(
-        output_path,
-        pagesize=letter,
-        rightMargin=72,
-        leftMargin=72,
-        topMargin=72,
-        bottomMargin=72
-    )
+JOB DESCRIPTION:
+{job_description}
+
+Return ONLY valid JSON with this structure:
+{{
+    "keywords": ["important keywords from JD"],
+    "required_skills": ["required technical skills"],
+    "preferred_skills": ["nice-to-have skills"],
+    "action_verbs": ["action verbs used in JD"],
+    "role_level": "entry/mid/senior/lead",
+    "industry_terms": ["industry-specific terms"]
+}}"""
     
-    styles = getSampleStyleSheet()
+    response = await analyze_with_llm(prompt, session_id)
     
-    # Custom styles
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=16,
-        spaceAfter=12,
-        textColor='#1a1a1a'
-    )
+    try:
+        # Clean response
+        clean = response.strip()
+        if clean.startswith('```'):
+            clean = clean.split('\n', 1)[1]
+        if clean.endswith('```'):
+            clean = clean.rsplit('```', 1)[0]
+        return json.loads(clean.strip())
+    except:
+        return {
+            "keywords": [],
+            "required_skills": [],
+            "preferred_skills": [],
+            "action_verbs": [],
+            "role_level": "mid",
+            "industry_terms": []
+        }
+
+async def generate_suggestions(resume_text: str, jd_analysis: Dict, missing_keywords: List[str], current_score: int, session_id: str) -> List[Dict]:
+    """Generate specific suggestions to improve ATS score."""
     
-    section_style = ParagraphStyle(
-        'SectionHeader',
-        parent=styles['Heading2'],
-        fontSize=12,
-        spaceAfter=8,
-        spaceBefore=16,
-        textColor='#333333',
-        borderPadding=4
-    )
+    prompt = f"""You are an ATS optimization expert. Analyze this resume against the job requirements and suggest SPECIFIC text replacements.
+
+RESUME TEXT:
+{resume_text}
+
+JOB REQUIREMENTS:
+- Required Skills: {', '.join(jd_analysis.get('required_skills', []))}
+- Keywords: {', '.join(jd_analysis.get('keywords', []))}
+- Missing Keywords in Resume: {', '.join(missing_keywords)}
+
+CURRENT ATS SCORE: {current_score}/100
+TARGET: Get score above 70
+
+Generate suggestions to improve the resume. For each suggestion:
+1. Find a SPECIFIC sentence or phrase that exists in the resume
+2. Suggest a better version that includes relevant keywords
+3. Keep the same meaning - DO NOT fabricate experience
+
+Return ONLY valid JSON array:
+[
+    {{
+        "section": "summary|skills|experience|education|projects",
+        "original_text": "EXACT text from resume to replace (must exist in resume)",
+        "suggested_text": "improved version with keywords",
+        "reason": "why this improves ATS score",
+        "keywords_added": ["list", "of", "keywords"],
+        "impact": "high|medium|low"
+    }}
+]
+
+RULES:
+- original_text MUST be an exact match from the resume
+- Maximum 8 suggestions
+- Focus on HIGH IMPACT changes first
+- Never add fake metrics or experience
+- Keep professional tone"""
+
+    response = await analyze_with_llm(prompt, session_id + "-suggestions")
     
-    body_style = ParagraphStyle(
-        'CustomBody',
-        parent=styles['Normal'],
-        fontSize=10,
-        spaceAfter=6,
-        leading=14,
-        textColor='#444444'
-    )
-    
-    bullet_style = ParagraphStyle(
-        'BulletStyle',
-        parent=styles['Normal'],
-        fontSize=10,
-        leftIndent=20,
-        spaceAfter=4,
-        leading=14,
-        textColor='#444444'
-    )
-    
-    story = []
-    
-    # Summary
-    if resume_data.get('summary'):
-        story.append(Paragraph("PROFESSIONAL SUMMARY", section_style))
-        story.append(Paragraph(resume_data['summary'], body_style))
-        story.append(Spacer(1, 12))
-    
-    # Skills
-    if resume_data.get('skills'):
-        story.append(Paragraph("SKILLS", section_style))
-        skills_text = ", ".join(resume_data['skills']) if isinstance(resume_data['skills'], list) else resume_data['skills']
-        story.append(Paragraph(skills_text, body_style))
-        story.append(Spacer(1, 12))
-    
-    # Experience
-    if resume_data.get('experience'):
-        story.append(Paragraph("PROFESSIONAL EXPERIENCE", section_style))
-        for exp in resume_data['experience']:
-            if isinstance(exp, str):
-                for line in exp.split('\n'):
-                    if line.strip():
-                        if line.strip().startswith('•') or line.strip().startswith('-'):
-                            story.append(Paragraph(line.strip()[1:].strip(), bullet_style))
-                        else:
-                            story.append(Paragraph(line.strip(), body_style))
-        story.append(Spacer(1, 12))
-    
-    # Education
-    if resume_data.get('education'):
-        story.append(Paragraph("EDUCATION", section_style))
-        for edu in resume_data['education']:
-            if isinstance(edu, str):
-                for line in edu.split('\n'):
-                    if line.strip():
-                        story.append(Paragraph(line.strip(), body_style))
-        story.append(Spacer(1, 12))
-    
-    # Projects
-    if resume_data.get('projects'):
-        story.append(Paragraph("PROJECTS", section_style))
-        for proj in resume_data['projects']:
-            if isinstance(proj, str):
-                for line in proj.split('\n'):
-                    if line.strip():
-                        story.append(Paragraph(line.strip(), body_style))
-        story.append(Spacer(1, 12))
-    
-    # Other content
-    if resume_data.get('other'):
-        story.append(Paragraph(resume_data['other'], body_style))
-    
-    doc.build(story)
-    return output_path
+    try:
+        clean = response.strip()
+        if clean.startswith('```'):
+            clean = clean.split('\n', 1)[1]
+        if clean.endswith('```'):
+            clean = clean.rsplit('```', 1)[0]
+        suggestions = json.loads(clean.strip())
+        
+        # Add IDs to suggestions
+        for sugg in suggestions:
+            sugg['id'] = str(uuid.uuid4())
+        
+        return suggestions
+    except Exception as e:
+        logger.error(f"Failed to parse suggestions: {e}")
+        return []
 
 # =============================================================================
 # API ROUTES
@@ -350,319 +453,210 @@ def generate_pdf(resume_data: Dict[str, Any], output_path: str) -> str:
 
 @api_router.get("/")
 async def root():
-    return {"message": "ResumeAI - ATS Optimization Agent API"}
+    return {"message": "ResumeAI - ATS Optimization Agent API (No Database)"}
 
-@api_router.post("/upload-resume", response_model=UploadResponse)
-async def upload_resume(file: UploadFile = File(...)):
-    """Upload and parse a resume (PDF or DOCX)."""
+@api_router.post("/analyze")
+async def analyze_resume(
+    file: UploadFile = File(...),
+    job_description: str = Form(...)
+):
+    """
+    Analyze resume against job description.
+    Returns ATS score and suggestions for improvement.
+    """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
     
     file_ext = file.filename.lower().split('.')[-1]
-    if file_ext not in ['pdf', 'docx']:
-        raise HTTPException(status_code=400, detail="Only PDF and DOCX files are supported")
+    if file_ext != 'pdf':
+        raise HTTPException(status_code=400, detail="Only PDF files are supported for template preservation")
     
     # Read file content
-    content = await file.read()
+    pdf_bytes = await file.read()
     
-    # Extract text based on file type
-    try:
-        if file_ext == 'pdf':
-            resume_text = extract_text_from_pdf(content)
-        else:
-            resume_text = extract_text_from_docx(content)
-    except Exception as e:
-        logger.error(f"Error extracting text: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
+    # Extract text with positions
+    extraction = extract_text_with_positions(pdf_bytes)
+    resume_text = extraction["full_text"]
     
     if not resume_text.strip():
-        raise HTTPException(status_code=400, detail="Could not extract text from the file")
-    
-    # Parse sections
-    sections = parse_resume_sections(resume_text)
+        raise HTTPException(status_code=400, detail="Could not extract text from PDF")
     
     # Create session
     session_id = str(uuid.uuid4())
-    session_doc = {
+    
+    # Step 1: Analyze Job Description
+    jd_analysis = await extract_jd_keywords(job_description, session_id)
+    
+    # Step 2: Calculate ATS Score
+    all_keywords = jd_analysis.get('keywords', []) + jd_analysis.get('required_skills', [])
+    score_data = calculate_ats_score(resume_text, jd_analysis.get('keywords', []), jd_analysis.get('required_skills', []))
+    
+    current_score = score_data["score"]
+    missing_keywords = score_data["missing_keywords"]
+    
+    # Step 3: Generate Issues List
+    issues = []
+    if current_score < 70:
+        issues.append(f"ATS Score is {current_score}/100 - needs improvement to reach 70+")
+    if len(missing_keywords) > 5:
+        issues.append(f"Missing {len(missing_keywords)} important keywords from job description")
+    if score_data["action_verb_count"] < 3:
+        issues.append("Resume lacks strong action verbs")
+    if score_data["metrics_count"] < 2:
+        issues.append("Resume lacks quantifiable achievements/metrics")
+    
+    # Step 4: Generate Suggestions
+    suggestions = []
+    if current_score < 70 or len(missing_keywords) > 0:
+        suggestions = await generate_suggestions(
+            resume_text, 
+            jd_analysis, 
+            missing_keywords, 
+            current_score, 
+            session_id
+        )
+    
+    # Calculate potential score if all suggestions approved
+    potential_keywords_added = set()
+    for sugg in suggestions:
+        potential_keywords_added.update(sugg.get('keywords_added', []))
+    
+    potential_score = min(100, current_score + len(potential_keywords_added) * 3 + len(suggestions) * 2)
+    
+    # Store session in memory
+    sessions[session_id] = {
         "id": session_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "pdf_bytes": base64.b64encode(pdf_bytes).decode('utf-8'),
         "resume_text": resume_text,
-        "resume_sections": sections,
-        "job_description": "",
-        "jd_analysis": {},
-        "ats_analysis": None,
-        "suggestions": [],
-        "approved_changes": [],
-        "rejected_changes": [],
-        "optimized_resume": "",
-        "pdf_path": "",
-        "status": "created"
+        "job_description": job_description,
+        "jd_analysis": jd_analysis,
+        "ats_score_before": current_score,
+        "ats_score_potential": potential_score,
+        "missing_keywords": missing_keywords,
+        "suggestions": suggestions,
+        "issues": issues,
+        "text_blocks": extraction["text_blocks"]
     }
     
-    await db.sessions.insert_one(session_doc)
-    
-    sections_found = [k for k, v in sections.items() if v]
-    
-    return UploadResponse(
-        session_id=session_id,
-        message="Resume uploaded and parsed successfully",
-        resume_preview=resume_text[:500] + "..." if len(resume_text) > 500 else resume_text,
-        sections_found=sections_found
-    )
+    return {
+        "session_id": session_id,
+        "ats_score_before": current_score,
+        "ats_score_potential": potential_score,
+        "issues": issues,
+        "suggestions": suggestions,
+        "jd_keywords": all_keywords,
+        "missing_keywords": missing_keywords,
+        "matched_keywords": score_data["matched_keywords"],
+        "message": f"Analysis complete. Current score: {current_score}/100. Potential after optimization: {potential_score}/100"
+    }
 
-@api_router.post("/analyze")
-async def analyze_resume(request: AnalyzeRequest):
-    """Analyze resume against job description and generate suggestions."""
-    # Get session
-    session = await db.sessions.find_one({"id": request.session_id}, {"_id": 0})
+@api_router.post("/apply")
+async def apply_changes(request: ApplyRequest):
+    """
+    Apply approved suggestions and return modified PDF.
+    """
+    session = sessions.get(request.session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(status_code=404, detail="Session not found or expired")
     
-    resume_text = session['resume_text']
-    resume_sections = session['resume_sections']
-    job_description = request.job_description
+    # Get original PDF bytes
+    pdf_bytes = base64.b64decode(session["pdf_bytes"])
     
-    # Step 1: Analyze Job Description with LLM
-    jd_prompt = f"""Analyze this job description and extract key information. Return ONLY valid JSON:
-
-Job Description:
-{job_description}
-
-Return JSON with this exact structure:
-{{
-    "keywords": ["list of important keywords"],
-    "required_skills": ["list of required skills"],
-    "role_level": "entry/mid/senior/lead",
-    "tools_technologies": ["list of tools and technologies mentioned"]
-}}"""
+    # Filter approved suggestions
+    approved_suggestions = [
+        s for s in session["suggestions"] 
+        if s["id"] in request.approved_ids
+    ]
     
-    jd_response = await analyze_with_llm(jd_prompt, request.session_id)
+    if not approved_suggestions:
+        raise HTTPException(status_code=400, detail="No suggestions approved")
     
-    try:
-        # Clean up the response - remove markdown code blocks if present
-        jd_clean = jd_response.strip()
-        if jd_clean.startswith('```'):
-            jd_clean = jd_clean.split('\n', 1)[1]  # Remove first line with ```json
-        if jd_clean.endswith('```'):
-            jd_clean = jd_clean.rsplit('```', 1)[0]
-        jd_analysis = json.loads(jd_clean.strip())
-    except json.JSONDecodeError:
-        logger.warning(f"Failed to parse JD analysis: {jd_response}")
-        jd_analysis = {
-            "keywords": [],
-            "required_skills": [],
-            "role_level": "mid",
-            "tools_technologies": []
-        }
-    
-    # Step 2: Calculate initial ATS score
-    keywords = jd_analysis.get('keywords', [])
-    required_skills = jd_analysis.get('required_skills', [])
-    score_before = calculate_ats_score(resume_text, keywords, required_skills)
-    
-    # Step 3: Generate improvement suggestions with LLM
-    suggestions_prompt = f"""You are an ATS optimization expert. Compare this resume with the job description and suggest specific improvements.
-
-RESUME:
-{resume_text}
-
-JOB DESCRIPTION KEYWORDS: {', '.join(keywords)}
-REQUIRED SKILLS: {', '.join(required_skills)}
-
-Generate suggestions to improve ATS compatibility. For each suggestion:
-1. Identify weak or missing content
-2. Suggest specific rewrites using action verbs and quantified impact
-3. Include relevant keywords naturally
-
-Return ONLY valid JSON array with this structure:
-[
-    {{
-        "section": "summary|skills|experience|education|projects",
-        "original_text": "the original text to replace",
-        "suggested_text": "the improved text",
-        "reason": "why this change improves ATS score",
-        "keywords_added": ["list", "of", "keywords", "added"]
-    }}
-]
-
-IMPORTANT: 
-- Never fabricate experience or metrics
-- Keep suggestions truthful and professional
-- Maximum 6 suggestions focusing on highest impact areas"""
-    
-    suggestions_response = await analyze_with_llm(suggestions_prompt, request.session_id + "-suggestions")
-    
-    try:
-        # Clean up response
-        sugg_clean = suggestions_response.strip()
-        if sugg_clean.startswith('```'):
-            sugg_clean = sugg_clean.split('\n', 1)[1]
-        if sugg_clean.endswith('```'):
-            sugg_clean = sugg_clean.rsplit('```', 1)[0]
-        suggestions_raw = json.loads(sugg_clean.strip())
-    except json.JSONDecodeError:
-        logger.warning(f"Failed to parse suggestions: {suggestions_response}")
-        suggestions_raw = []
-    
-    # Add IDs to suggestions
-    suggestions = []
-    for sugg in suggestions_raw:
-        suggestions.append({
-            "id": str(uuid.uuid4()),
-            "section": sugg.get('section', 'other'),
-            "original_text": sugg.get('original_text', ''),
-            "suggested_text": sugg.get('suggested_text', ''),
-            "reason": sugg.get('reason', ''),
-            "keywords_added": sugg.get('keywords_added', []),
-            "status": "pending"
+    # Prepare replacements
+    replacements = []
+    for sugg in approved_suggestions:
+        replacements.append({
+            "original_text": sugg["original_text"],
+            "new_text": sugg["suggested_text"]
         })
     
-    # Find missing keywords
-    resume_lower = resume_text.lower()
-    missing_keywords = [kw for kw in keywords if kw.lower() not in resume_lower]
-    
-    # Update session
-    ats_analysis = {
-        "score_before": score_before,
-        "score_after": None,
-        "missing_keywords": missing_keywords,
-        "weak_bullets": [],
-        "suggestions": suggestions
-    }
-    
-    await db.sessions.update_one(
-        {"id": request.session_id},
-        {"$set": {
-            "job_description": job_description,
-            "jd_analysis": jd_analysis,
-            "ats_analysis": ats_analysis,
-            "suggestions": suggestions,
-            "status": "analyzed"
-        }}
-    )
-    
-    return {
-        "session_id": request.session_id,
-        "score_before": score_before,
-        "missing_keywords": missing_keywords,
-        "jd_analysis": jd_analysis,
-        "suggestions": suggestions,
-        "message": "Analysis complete. Please review and approve suggestions."
-    }
-
-@api_router.post("/approve")
-async def approve_changes(request: ApproveRequest):
-    """Apply approved changes and generate optimized resume."""
-    session = await db.sessions.find_one({"id": request.session_id}, {"_id": 0})
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    suggestions = session.get('suggestions', [])
-    resume_sections = session.get('resume_sections', {})
-    resume_text = session.get('resume_text', '')
-    jd_analysis = session.get('jd_analysis', {})
-    
-    # Update suggestion statuses
-    for sugg in suggestions:
-        if sugg['id'] in request.approved_ids:
-            sugg['status'] = 'approved'
-        elif sugg['id'] in request.rejected_ids:
-            sugg['status'] = 'rejected'
-    
-    # Apply approved changes to resume text
-    optimized_text = resume_text
-    optimized_sections = dict(resume_sections)
-    
-    for sugg in suggestions:
-        if sugg['status'] == 'approved':
-            # Apply to full text
-            if sugg['original_text'] and sugg['original_text'] in optimized_text:
-                optimized_text = optimized_text.replace(sugg['original_text'], sugg['suggested_text'])
-            
-            # Apply to sections
-            section = sugg['section']
-            if section in optimized_sections:
-                if isinstance(optimized_sections[section], str):
-                    if sugg['original_text'] in optimized_sections[section]:
-                        optimized_sections[section] = optimized_sections[section].replace(
-                            sugg['original_text'], sugg['suggested_text']
-                        )
-                elif isinstance(optimized_sections[section], list):
-                    for i, item in enumerate(optimized_sections[section]):
-                        if isinstance(item, str) and sugg['original_text'] in item:
-                            optimized_sections[section][i] = item.replace(
-                                sugg['original_text'], sugg['suggested_text']
-                            )
-    
-    # Calculate new ATS score
-    keywords = jd_analysis.get('keywords', [])
-    required_skills = jd_analysis.get('required_skills', [])
-    score_after = calculate_ats_score(optimized_text, keywords, required_skills)
-    
-    # Generate PDF
-    pdf_filename = f"optimized_resume_{request.session_id}.pdf"
-    pdf_path = str(PDF_OUTPUT_DIR / pdf_filename)
-    
+    # Modify PDF
     try:
-        generate_pdf(optimized_sections, pdf_path)
+        modified_pdf = modify_pdf_text(pdf_bytes, replacements)
     except Exception as e:
-        logger.error(f"PDF generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {str(e)}")
+        logger.error(f"PDF modification error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to modify PDF: {str(e)}")
     
-    # Update session
-    await db.sessions.update_one(
-        {"id": request.session_id},
-        {"$set": {
-            "suggestions": suggestions,
-            "approved_changes": request.approved_ids,
-            "rejected_changes": request.rejected_ids,
-            "optimized_resume": optimized_text,
-            "optimized_sections": optimized_sections,
-            "ats_analysis.score_after": score_after,
-            "pdf_path": pdf_path,
-            "status": "completed"
-        }}
+    # Calculate new score
+    new_text = extract_text_simple(modified_pdf)
+    jd_analysis = session["jd_analysis"]
+    new_score_data = calculate_ats_score(
+        new_text, 
+        jd_analysis.get('keywords', []), 
+        jd_analysis.get('required_skills', [])
     )
     
-    # Get score before
-    score_before = session.get('ats_analysis', {}).get('score_before', 0)
+    # Update session
+    session["ats_score_after"] = new_score_data["score"]
+    session["modified_pdf"] = base64.b64encode(modified_pdf).decode('utf-8')
+    session["applied_suggestions"] = request.approved_ids
     
     return {
         "session_id": request.session_id,
-        "score_before": score_before,
-        "score_after": score_after,
-        "score_improvement": score_after - score_before,
-        "changes_applied": len(request.approved_ids),
-        "changes_rejected": len(request.rejected_ids),
-        "pdf_ready": True,
-        "message": "Changes applied successfully. Your optimized resume is ready for download."
+        "ats_score_before": session["ats_score_before"],
+        "ats_score_after": new_score_data["score"],
+        "changes_applied": len(approved_suggestions),
+        "message": f"Applied {len(approved_suggestions)} changes. New ATS score: {new_score_data['score']}/100"
     }
 
 @api_router.get("/download/{session_id}")
-async def download_resume(session_id: str):
-    """Download the optimized resume PDF."""
-    session = await db.sessions.find_one({"id": session_id}, {"_id": 0})
+async def download_pdf(session_id: str):
+    """Download the modified PDF."""
+    session = sessions.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    pdf_path = session.get('pdf_path')
-    if not pdf_path or not os.path.exists(pdf_path):
-        raise HTTPException(status_code=404, detail="PDF not generated yet")
+    if "modified_pdf" not in session:
+        raise HTTPException(status_code=400, detail="No modifications applied yet")
     
-    return FileResponse(
-        path=pdf_path,
-        filename=f"optimized_resume_{session_id}.pdf",
-        media_type="application/pdf"
+    pdf_bytes = base64.b64decode(session["modified_pdf"])
+    
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=optimized_resume_{session_id[:8]}.pdf"
+        }
     )
 
 @api_router.get("/session/{session_id}")
 async def get_session(session_id: str):
-    """Get session details and state."""
-    session = await db.sessions.find_one({"id": session_id}, {"_id": 0})
+    """Get session details."""
+    session = sessions.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    return session
+    # Return session without the binary PDF data
+    return {
+        "id": session["id"],
+        "created_at": session["created_at"],
+        "ats_score_before": session["ats_score_before"],
+        "ats_score_potential": session.get("ats_score_potential"),
+        "ats_score_after": session.get("ats_score_after"),
+        "issues": session["issues"],
+        "suggestions": session["suggestions"],
+        "missing_keywords": session["missing_keywords"],
+        "jd_analysis": session["jd_analysis"],
+        "applied_suggestions": session.get("applied_suggestions", [])
+    }
+
+@api_router.delete("/session/{session_id}")
+async def delete_session(session_id: str):
+    """Delete a session to free memory."""
+    if session_id in sessions:
+        del sessions[session_id]
+        return {"message": "Session deleted"}
+    raise HTTPException(status_code=404, detail="Session not found")
 
 # Include the router in the main app
 app.include_router(api_router)
@@ -670,11 +664,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
