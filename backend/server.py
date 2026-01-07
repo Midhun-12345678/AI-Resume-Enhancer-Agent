@@ -88,7 +88,9 @@ def extract_text_with_positions(pdf_bytes: bytes) -> Dict[str, Any]:
     text_blocks = []
     full_text = ""
     
-    for page_num in range(len(doc)):
+    page_count = len(doc)
+    
+    for page_num in range(page_count):
         page = doc[page_num]
         
         # Get detailed text blocks with formatting
@@ -118,7 +120,7 @@ def extract_text_with_positions(pdf_bytes: bytes) -> Dict[str, Any]:
     return {
         "text_blocks": text_blocks,
         "full_text": full_text.strip(),
-        "page_count": len(doc)
+        "page_count": page_count
     }
 
 def extract_text_simple(pdf_bytes: bytes) -> str:
